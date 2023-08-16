@@ -1,20 +1,33 @@
-use clap::Parser;
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use clap::{Parser, ValueEnum};
+use flate2::{write::GzEncoder, Compression};
 use indicatif::ProgressBar;
 use std::{
     fs::{remove_file, File, OpenOptions},
-    io::{prelude::*, BufReader},
+    io::{prelude::*, BufReader, Result},
     net::TcpListener,
+    path::PathBuf,
     process,
+    str::FromStr,
 };
 use tar::Builder;
+use walkdir::WalkDir;
+use zip::{write::FileOptions, CompressionMethod::Zstd, ZipWriter};
 
 /// woof in Rust, send any number of files/directories over a local network quickly
 #[derive(Parser)]
 struct Cli {
     /// Files or directories to send
-    paths: Vec<std::path::PathBuf>,
+    paths: Vec<PathBuf>,
+
+    #[arg(
+        value_enum,
+        short,
+        long,
+        default_value_t = Encoding::Tgz,
+        help="Archive encoding",
+        long_help="Encoding to use when building archive for multiple files"
+    )]
+    encoding: Encoding,
 
     #[arg(short, long, default_value_t = String::from("127.0.0.1"))]
     ip: String,
@@ -23,10 +36,29 @@ struct Cli {
     port: u16,
 }
 
-fn main() -> std::io::Result<()> {
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Encoding {
+    /// .tar.gz
+    Tgz,
+    /// .zip
+    Zip,
+}
+
+const TEMP_FILE: &str = "woof-rs";
+const BUF_SIZE: usize = 32 * 1024; // BufReader::new(f) default is 8KB = 8 * 1024
+
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    const TEMP_FILE: &str = "woof-rs.tar.gz";
-    const BUF_SIZE: usize = 32 * 1024; // BufReader::new(f) default is 8KB = 8 * 1024
+    let temp = match cli.encoding {
+        Encoding::Tgz => {
+            format!("{TEMP_FILE}.tar.gz")
+        }
+        Encoding::Zip => {
+            format!("{TEMP_FILE}.zip")
+        }
+    };
+    let temp_file = temp.as_str();
+
     let mut keep_archive = false;
 
     // if first path doesn't exist, exit
@@ -42,52 +74,12 @@ fn main() -> std::io::Result<()> {
         // 1 file only
         p_0.to_str().unwrap()
     } else if cli.paths.len() > 1 || p_0.is_dir() {
-        // multiple files/dirs, prep the archive
-        println!("Adding files/dirs to {TEMP_FILE}...");
+        // multiple files/dirs
+        println!("Adding files/dirs to {temp_file}...");
+        keep_archive = archive(temp_file, cli.encoding, cli.paths)?;
+        println!("{temp_file} written successfully!");
 
-        let tar_gz = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(TEMP_FILE)?;
-        let enc = GzEncoder::new(tar_gz, Compression::fast());
-        let mut tar = Builder::new(enc);
-
-        let bar = ProgressBar::new(cli.paths.len().try_into().unwrap());
-        for i in 0..cli.paths.len() {
-            let current = cli.paths.get(i).unwrap();
-
-            // add file to archive
-            if current.is_file() {
-                let mut f = File::open(current)?;
-                tar.append_file(current, &mut f)?;
-                keep_archive = true
-            }
-            // add dir to archive with dirname as last path component
-            else if current.is_dir() {
-                let dirname = current.file_name().unwrap().to_str().unwrap();
-                let archive_dirname = format!("{dirname}-{i}");
-                tar.append_dir_all(archive_dirname, current)?;
-                keep_archive = true
-            }
-            // if neither, print error
-            else {
-                println!("Error: {:?} is not a valid path", current);
-            }
-
-            bar.inc(1);
-        }
-        tar.finish()?;
-
-        if !keep_archive {
-            eprintln!("Error: Archive does not contain any files, exiting...");
-            remove_file(TEMP_FILE)?;
-            process::exit(-1);
-        }
-
-        println!("{TEMP_FILE} written successfully!");
-
-        TEMP_FILE
+        temp_file
     } else {
         // first path is invalid
         eprintln!("{:?} is not a valid path, exiting...", p_0);
@@ -133,8 +125,125 @@ fn main() -> std::io::Result<()> {
 
     // cleanup
     if keep_archive {
-        remove_file(TEMP_FILE)?;
+        remove_file(temp_file)?;
     }
 
+    Ok(())
+}
+
+fn archive(temp_file: &str, enc: Encoding, paths: Vec<PathBuf>) -> Result<bool> {
+    let mut has_files = false;
+    let f = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(temp_file)?;
+    let bar = ProgressBar::new(paths.len().try_into().unwrap());
+
+    match enc {
+        Encoding::Tgz => {
+            let enc = GzEncoder::new(f, Compression::fast());
+            let mut tar = Builder::new(enc);
+
+            for (i, path) in paths.iter().enumerate() {
+                let p = path.file_name().unwrap().to_str().unwrap();
+
+                // add file to archive
+                if path.is_file() {
+                    let mut f = File::open(path)?;
+                    tar.append_file(p, &mut f)?;
+                    has_files = true
+                }
+                // add dir to archive with dirname as last path component
+                else if path.is_dir() {
+                    let dirname = format!("{p}-{i}");
+                    tar.append_dir_all(dirname, path).unwrap();
+                    has_files = true
+                }
+                // if neither, print error
+                else {
+                    println!("Error: {:?} is not a valid path", path);
+                }
+
+                bar.inc(1);
+            }
+            tar.finish()?;
+        }
+
+        Encoding::Zip => {
+            let mut zip = ZipWriter::new(f);
+            let options = FileOptions::default()
+                .compression_method(Zstd)
+                .unix_permissions(0o755);
+
+            // zip is confusing because you have to encode each file separately
+            for (i, path) in paths.iter().enumerate() {
+                let p = path.file_name().unwrap().to_str().unwrap();
+
+                // add file to archive
+                if path.is_file() {
+                    let f = File::open(path)?;
+                    zip_add_file(&mut zip, f, p, options)?;
+                    has_files = true;
+                }
+                // add dir to archive with dirname as last path component
+                else if path.is_dir() {
+                    let dirname = PathBuf::from_str(format!("{p}-{i}").as_str()).unwrap();
+
+                    let walkdir = WalkDir::new(path);
+                    for entry in walkdir.into_iter() {
+                        let e = entry?;
+                        let e_path = e.path();
+                        let e_child = e_path.strip_prefix(path.as_path()).unwrap();
+                        let e_new = dirname.join(e_child);
+
+                        // walkdir starts from the topmost directory, so e_child is empty
+                        match e_child.file_name() {
+                            Some(_) => {
+                                if e_path.is_file() {
+                                    let f = File::open(e_path)?;
+                                    zip_add_file(&mut zip, f, e_new.to_str().unwrap(), options)?;
+                                } else if e_path.is_dir() {
+                                    zip.add_directory(e_new.to_str().unwrap(), options)?;
+                                }
+                            }
+                            None => {
+                                // topmost dir
+                                zip.add_directory(dirname.to_str().unwrap(), options)?;
+                            }
+                        }
+                    }
+                    has_files = true
+                }
+                // if neither, print error
+                else {
+                    println!("Error: {:?} is not a valid path", path);
+                }
+            }
+            zip.finish()?;
+        }
+    }
+
+    if !has_files {
+        eprintln!("Error: Archive does not contain any files, exiting...");
+        remove_file(temp_file)?;
+        process::exit(-1);
+    }
+
+    Ok(has_files)
+}
+
+fn zip_add_file(zip: &mut ZipWriter<File>, f: File, p: &str, options: FileOptions) -> Result<()> {
+    let mut f_reader = BufReader::new(f);
+    zip.start_file(p, options)?;
+    loop {
+        let buf = f_reader.fill_buf()?;
+        let length = buf.len();
+        if length == 0 {
+            break;
+        }
+        zip.write_all(buf)?;
+        f_reader.consume(length);
+    }
     Ok(())
 }
