@@ -1,6 +1,7 @@
 use clap::Parser;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use indicatif::ProgressBar;
 use std::{
     fs::{remove_file, File, OpenOptions},
     io::{prelude::*, BufReader},
@@ -25,6 +26,7 @@ struct Cli {
 fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     const TEMP_FILE: &str = "woof-rs.tar.gz";
+    const BUF_SIZE: usize = 32 * 1024; // BufReader::new(f) default is 8KB = 8 * 1024
     let mut keep_archive = false;
 
     // if first path doesn't exist, exit
@@ -51,6 +53,7 @@ fn main() -> std::io::Result<()> {
         let enc = GzEncoder::new(tar_gz, Compression::fast());
         let mut tar = Builder::new(enc);
 
+        let bar = ProgressBar::new(cli.paths.len().try_into().unwrap());
         for i in 0..cli.paths.len() {
             let current = cli.paths.get(i).unwrap();
 
@@ -69,8 +72,10 @@ fn main() -> std::io::Result<()> {
             }
             // if neither, print error
             else {
-                eprintln!("Error: {:?} is not a valid path", current);
+                println!("Error: {:?} is not a valid path", current);
             }
+
+            bar.inc(1);
         }
         tar.finish()?;
 
@@ -91,7 +96,10 @@ fn main() -> std::io::Result<()> {
 
     // setup the response
     let f = File::open(f_name)?;
-    let mut f_reader = BufReader::new(f);
+    // let f_size = f.metadata()?.len();
+    // let buf_size: u64 = BUF_SIZE.try_into().unwrap();
+    // let chunks: u64 = (f_size + buf_size - 1) / buf_size; // ceiling div
+    let mut f_reader = BufReader::with_capacity(BUF_SIZE, f);
     let headers = [
         "HTTP/1.1 200 OK",
         "Content-Type: application/octet-stream",
@@ -104,7 +112,7 @@ fn main() -> std::io::Result<()> {
     // the web portion
     let addr = format!("{}:{}", cli.ip, cli.port);
     let listener = TcpListener::bind(&addr)?;
-    println!("Serving {} at http://{}", f_name, addr);
+    println!("\nServing {} at http://{}", f_name, addr);
 
     // send the file on GET request
     let (mut stream, _) = listener.accept()?;
@@ -113,7 +121,7 @@ fn main() -> std::io::Result<()> {
         stream.write_all(&headers)?;
         // buffered write so we don't store the entire file in memory
         loop {
-            let buf = f_reader.fill_buf()?; // default is 8KB
+            let buf = f_reader.fill_buf()?;
             let length = buf.len();
             if length == 0 {
                 break;
